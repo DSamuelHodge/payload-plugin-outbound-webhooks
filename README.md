@@ -88,6 +88,15 @@ Delivery is **at-least-once**, with retries classified by failure type:
 
 On a retry, only endpoints still pending are re-attempted: endpoints that already succeeded or permanently failed for that `deliveryId` are skipped (tracked via the `webhookLogs` collection, so this requires `enableDeliveryLog` to stay on). Because a retry can still redeliver to an endpoint that failed with a transient error, receivers should dedupe on `deliveryId` (or the `X-Webhook-Id` header) rather than `(event, docId)`.
 
+## Circuit-breaker
+
+Retries are per-delivery; the circuit-breaker protects you *across* deliveries. After `failureThreshold` consecutive failures (default `5`, set to `0` to disable), an endpoint is automatically disabled so a dead destination stops burning job retries:
+
+- **Admin-managed endpoints** (`webhookEndpoints` collection) keep a persistent `consecutiveFailures` counter on their doc. Any success resets it; reaching the threshold sets `autoDisabled`, and delivery skips the endpoint from then on. This works even with `enableDeliveryLog: false`. To re-enable, fix the destination and uncheck `autoDisabled` in the admin UI (the counter resets on the next success).
+- **Static endpoints** (the `endpoints` array) have no doc to store a counter on, so the breaker reads their recent delivery history instead: if the last `failureThreshold` attempts for that URL all failed, the endpoint is skipped for this delivery (reported as `skipped` in the job output). This requires `enableDeliveryLog` to stay on — with the log disabled there is no history to read, so static endpoints are attempted every time (same caveat as retry-skip above).
+
+Both retryable (5xx, timeouts) and permanent (4xx) failures count toward the streak — a `404` from a deleted destination trips the breaker just like a `500` storm does.
+
 ## Verifying the signature
 
 If an endpoint has a `secret` set, requests include an `X-Webhook-Signature` header formatted as `t=<unix timestamp>,v1=<hmac-sha256 hex digest>`, signed over `${timestamp}.${rawBody}`. Verify it on the receiving end:
@@ -114,6 +123,7 @@ The helper also rejects signatures older than 5 minutes by default (`toleranceSe
 | `enableEndpointsCollection`  | `boolean`                            | `true`                | Adds the `webhookEndpoints` admin collection.               |
 | `enableDeliveryLog`          | `boolean`                            | `true`                | Adds the `webhookLogs` admin collection.                    |
 | `maxRetries`                 | `number`                             | `5`                   | Job retry attempts per delivery.                            |
+| `failureThreshold`           | `number`                             | `5`                   | Consecutive failures before an endpoint is auto-disabled (`0` disables). |
 | `timeoutMs`                  | `number`                             | `10000`               | Per-attempt request timeout.                                |
 
 ## Development

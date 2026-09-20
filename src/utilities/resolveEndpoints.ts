@@ -11,6 +11,9 @@ function matchesSubscription(subscription: string, collectionSlug: string, event
 
 /**
  * Returns every active endpoint (static + admin-managed) subscribed to `collectionSlug.event`.
+ * Admin-managed endpoints tripped by the circuit-breaker (`autoDisabled`) are excluded —
+ * filtered in JS rather than in the query so endpoints created before the breaker
+ * fields existed (missing/undefined flag) keep working on every adapter.
  * Called from inside the delivery job, not the request/response cycle, so a DB read here
  * doesn't add latency to the triggering document save.
  */
@@ -42,7 +45,9 @@ export async function resolveEndpoints({
     dbEndpoints = result.docs as unknown as WebhookEndpoint[]
   }
 
-  return [...staticEndpoints, ...dbEndpoints].filter((endpoint) =>
-    endpoint.subscriptions?.some((sub) => matchesSubscription(sub, collectionSlug, event)),
+  return [...staticEndpoints, ...dbEndpoints].filter(
+    (endpoint) =>
+      !endpoint.autoDisabled &&
+      endpoint.subscriptions?.some((sub) => matchesSubscription(sub, collectionSlug, event)),
   )
 }

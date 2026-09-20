@@ -27,7 +27,16 @@ export function buildWebhookLogsCollection(slug: string): CollectionConfig {
         },
       },
       { name: 'event', type: 'text', required: true },
-      { name: 'endpointUrl', type: 'text', required: true },
+      {
+        name: 'endpointUrl',
+        type: 'text',
+        required: true,
+        index: true,
+        admin: {
+          description:
+            'Indexed: the circuit-breaker reads recent attempts per URL to protect static endpoints without a managed endpoint doc.',
+        },
+      },
       { name: 'endpointLabel', type: 'text' },
       { name: 'docId', type: 'text', required: true },
       { name: 'status', type: 'select', options: ['delivered', 'failed'], required: true },

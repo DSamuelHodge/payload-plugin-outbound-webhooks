@@ -1,6 +1,12 @@
 import type { Payload, TaskConfig } from 'payload'
 
 import type { OutboundWebhooksPluginConfig, WebhookEndpoint } from '../types.js'
+import {
+  countConsecutiveFailures,
+  isBreakerEnabled,
+  nextConsecutiveFailures,
+  resolveFailureThreshold,
+} from '../utilities/circuitBreaker.js'
 import { resolveEndpoints } from '../utilities/resolveEndpoints.js'
 import { signPayload } from '../utilities/signPayload.js'
 import { isRetryableStatus } from '../utilities/retryPolicy.js'
@@ -81,10 +87,13 @@ export function buildDeliverWebhookTask(pluginConfig: OutboundWebhooksPluginConf
       { name: 'delivered', type: 'number', required: true },
       { name: 'permanentlyFailed', type: 'number', required: true },
       { name: 'retryableFailed', type: 'number', required: true },
+      { name: 'skipped', type: 'number', required: true },
     ],
     handler: async ({ input, req }) => {
       const { deliveryId, collectionSlug, event, docId, doc, previousDoc, occurredAt } = input as DeliverWebhookInput
       const payload = req.payload
+      const breakerThreshold = resolveFailureThreshold(pluginConfig.failureThreshold)
+      const breakerOn = isBreakerEnabled(pluginConfig.failureThreshold)
 
       const allEndpoints = await resolveEndpoints({ payload, pluginConfig, collectionSlug, event })
 
@@ -97,11 +106,39 @@ export function buildDeliverWebhookTask(pluginConfig: OutboundWebhooksPluginConf
       let delivered = 0
       let permanentlyFailed = 0
       let retryableFailed = 0
+      let skipped = 0
 
       for (const endpoint of endpoints) {
+        // Circuit-breaker, history path: endpoints without a managed
+        // `webhookEndpoints` doc (static endpoints, or the endpoints collection
+        // is disabled) keep no persistent counter, so a streak of recent
+        // failures in the delivery log is the trip signal. Doc-backed endpoints
+        // carry their own counter (see recordBreakerOutcome) and were already
+        // filtered by resolveEndpoints once tripped.
+        if (
+          breakerOn &&
+          !isDocManagedEndpoint(pluginConfig, endpoint) &&
+          (await isTrippedByHistory({ payload, pluginConfig, url: endpoint.url, threshold: breakerThreshold }))
+        ) {
+          skipped += 1
+          continue
+        }
+
         const outcome = await attemptDelivery({ endpoint, deliveryId, collectionSlug, event, docId, doc, previousDoc, occurredAt, pluginConfig })
 
         await logDelivery({ payload, pluginConfig, endpoint, deliveryId, event: `${collectionSlug}.${event}`, docId, ...outcome })
+
+        // Circuit-breaker, persistent path: fold this attempt into the
+        // endpoint doc's failure streak, tripping `autoDisabled` at threshold.
+        // Works even with the delivery log disabled.
+        await recordBreakerOutcome({
+          payload,
+          pluginConfig,
+          endpoint,
+          outcome: outcome.status,
+          threshold: breakerThreshold,
+          breakerOn,
+        })
 
         if (outcome.status === 'delivered') delivered += 1
         else if (outcome.retryable) retryableFailed += 1
@@ -120,8 +157,111 @@ export function buildDeliverWebhookTask(pluginConfig: OutboundWebhooksPluginConf
         )
       }
 
-      return { output: { delivered, permanentlyFailed, retryableFailed } }
+      return { output: { delivered, permanentlyFailed, retryableFailed, skipped } }
     },
+  }
+}
+
+/** Endpoints carrying a `webhookEndpoints` doc id get persistent breaker state. */
+function isDocManagedEndpoint(
+  pluginConfig: OutboundWebhooksPluginConfig,
+  endpoint: WebhookEndpoint,
+): boolean {
+  return pluginConfig.enableEndpointsCollection !== false && endpoint.id != null
+}
+
+/**
+ * Log-derived trip check for endpoints without a managed doc. Reads at most
+ * `threshold` recent attempts for the URL (newest first) and trips when every
+ * one of them failed. Fail-open: a broken lookup attempts delivery rather
+ * than silently dropping it.
+ */
+async function isTrippedByHistory({
+  payload,
+  pluginConfig,
+  url,
+  threshold,
+}: {
+  payload: Payload
+  pluginConfig: OutboundWebhooksPluginConfig
+  url: string
+  threshold: number
+}): Promise<boolean> {
+  if (pluginConfig.enableDeliveryLog === false) return false
+
+  const slug = pluginConfig.logsCollectionSlug ?? 'webhookLogs'
+  try {
+    const result = await payload.find({
+      collection: slug as 'webhookLogs',
+      where: { endpointUrl: { equals: url } },
+      sort: '-deliveredAt',
+      limit: threshold,
+      depth: 0,
+      overrideAccess: true,
+    })
+    return (
+      countConsecutiveFailures(
+        result.docs as unknown as Array<{ status: 'delivered' | 'failed' }>,
+      ) >= threshold
+    )
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Folds an attempt into a doc-backed endpoint's failure streak. Success resets
+ * the counter; failure increments it and trips `autoDisabled` at threshold —
+ * after which resolveEndpoints skips the endpoint until an editor re-enables it.
+ *
+ * The update is guarded by URL as well as id: static endpoints may carry a
+ * custom `id` that must never touch an unrelated admin-managed doc (a
+ * non-matching where-update simply writes nothing). Concurrent deliveries can
+ * race this read-modify-write; the worst case is a slightly late trip, which
+ * is acceptable for a safety breaker.
+ *
+ * Never throws: breaker bookkeeping must not affect delivery/job outcome.
+ */
+async function recordBreakerOutcome({
+  payload,
+  pluginConfig,
+  endpoint,
+  outcome,
+  threshold,
+  breakerOn,
+}: {
+  payload: Payload
+  pluginConfig: OutboundWebhooksPluginConfig
+  endpoint: WebhookEndpoint
+  outcome: 'delivered' | 'failed'
+  threshold: number
+  breakerOn: boolean
+}): Promise<void> {
+  if (!breakerOn) return
+  if (!isDocManagedEndpoint(pluginConfig, endpoint)) return
+
+  const next = nextConsecutiveFailures(endpoint.consecutiveFailures, outcome)
+  // Nothing worth persisting: a success against an already-clean counter.
+  if (outcome === 'delivered' && next === 0 && !endpoint.consecutiveFailures) return
+
+  const data: { consecutiveFailures: number; lastFailureAt?: string; autoDisabled?: boolean } = {
+    consecutiveFailures: next,
+  }
+  if (outcome === 'failed') {
+    data.lastFailureAt = new Date().toISOString()
+    if (next >= threshold) data.autoDisabled = true
+  }
+
+  const slug = pluginConfig.endpointsCollectionSlug ?? 'webhookEndpoints'
+  try {
+    await payload.update({
+      collection: slug as 'webhookEndpoints',
+      where: { and: [{ id: { equals: endpoint.id } }, { url: { equals: endpoint.url } }] },
+      data: data as never,
+      overrideAccess: true,
+    })
+  } catch {
+    // Never let breaker bookkeeping affect delivery/job outcome.
   }
 }
 

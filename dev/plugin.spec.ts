@@ -129,4 +129,55 @@ describe('outboundWebhooksPlugin', () => {
       overrideAccess: true,
     })
   })
+
+  it('auto-disables an endpoint after failureThreshold consecutive failures', async () => {
+    const deadUrl = `http://localhost:${await getClosedPort()}/hook`
+    const deadEndpoint = await payload.create({
+      collection: 'webhookEndpoints',
+      data: {
+        label: 'Breaker test endpoint',
+        url: deadUrl,
+        subscriptions: ['orders.*'],
+      },
+      overrideAccess: true,
+    })
+
+    const readEndpoint = () =>
+      payload.findByID({ collection: 'webhookEndpoints', id: deadEndpoint.id, overrideAccess: true })
+    const countDeadLogs = async () => {
+      const { totalDocs } = await payload.count({
+        collection: 'webhookLogs',
+        where: { endpointUrl: { equals: deadUrl } },
+        overrideAccess: true,
+      })
+      return totalDocs
+    }
+
+    // First failure: streak recorded, endpoint still active.
+    await payload.create({ collection: 'orders', data: { total: 1 } })
+    await payload.jobs.run()
+    expect((await readEndpoint()).consecutiveFailures).toBe(1)
+    expect((await readEndpoint()).autoDisabled).not.toBe(true)
+
+    // Second consecutive failure trips the breaker (dev failureThreshold: 2).
+    await payload.create({ collection: 'orders', data: { total: 2 } })
+    await payload.jobs.run()
+    const tripped = await readEndpoint()
+    expect(tripped.consecutiveFailures).toBe(2)
+    expect(tripped.autoDisabled).toBe(true)
+    expect(await countDeadLogs()).toBe(2)
+
+    // Third delivery skips the tripped endpoint entirely: no new attempt logged.
+    await payload.create({ collection: 'orders', data: { total: 3 } })
+    await payload.jobs.run()
+    expect(await countDeadLogs()).toBe(2)
+    // Only the static receiver got each of the 3 orders.
+    expect(receivedRequests).toHaveLength(3)
+
+    await payload.delete({
+      collection: 'webhookEndpoints',
+      id: deadEndpoint.id,
+      overrideAccess: true,
+    })
+  })
 })

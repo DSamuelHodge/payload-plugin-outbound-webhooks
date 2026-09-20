@@ -56,6 +56,8 @@ export default buildConfig({
       // No retries here so tests observe exactly one delivery attempt per job run.
       // Production configs should leave the default (5) for at-least-once delivery.
       maxRetries: 0,
+      // Low so the circuit-breaker integration test trips after 2 failed deliveries.
+      failureThreshold: 2,
     }),
   ],
 })

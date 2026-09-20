@@ -26,6 +26,19 @@ export interface WebhookEndpoint {
   headers?: Record<string, string>
   /** Set to false to keep the endpoint configured but stop sending to it. @default true */
   active?: boolean
+  /**
+   * Consecutive delivery failures recorded by the circuit-breaker. Managed by
+   * the delivery job on admin-managed (`webhookEndpoints` collection) endpoints;
+   * reset to 0 on every success.
+   */
+  consecutiveFailures?: number
+  /**
+   * Set automatically once `consecutiveFailures` reaches `failureThreshold`.
+   * Skipped by delivery until an editor unchecks it (manual half-open reset).
+   */
+  autoDisabled?: boolean
+  /** ISO timestamp of the most recent failed attempt. Set by the delivery job. */
+  lastFailureAt?: string
 }
 
 /** Per-collection webhook configuration. */
@@ -64,6 +77,13 @@ export type OutboundWebhooksPluginConfig = {
   enableDeliveryLog?: boolean
   /** Number of delivery attempts before giving up. @default 5 */
   maxRetries?: number
+  /**
+   * Consecutive delivery failures after which an endpoint is automatically
+   * disabled (circuit-breaker). Applies to admin-managed endpoints via
+   * persistent counters, and to static endpoints via recent delivery history
+   * (which requires `enableDeliveryLog`). Set to 0 to disable. @default 5
+   */
+  failureThreshold?: number
   /** Request timeout in milliseconds per delivery attempt. @default 10000 */
   timeoutMs?: number
   /** Override the slug used for the endpoints collection. @default 'webhookEndpoints' */

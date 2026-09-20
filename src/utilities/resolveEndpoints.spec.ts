@@ -78,6 +78,31 @@ describe('resolveEndpoints', () => {
     ])
   })
 
+  it('excludes admin-managed endpoints tripped by the circuit-breaker', async () => {
+    const payload = stubPayload([
+      { url: 'https://example.com/tripped', subscriptions: ['orders.create'], autoDisabled: true },
+      { url: 'https://example.com/healthy', subscriptions: ['orders.create'], autoDisabled: false },
+    ])
+    const result = await resolveEndpoints({
+      payload,
+      pluginConfig: baseConfig(),
+      collectionSlug: 'orders',
+      event: 'create',
+    })
+    expect(result.map((e) => e.url)).toEqual(['https://example.com/healthy'])
+  })
+
+  it('keeps endpoints created before the breaker fields existed', async () => {
+    const payload = stubPayload([{ url: 'https://example.com/legacy', subscriptions: ['orders.create'] }])
+    const result = await resolveEndpoints({
+      payload,
+      pluginConfig: baseConfig(),
+      collectionSlug: 'orders',
+      event: 'create',
+    })
+    expect(result.map((e) => e.url)).toEqual(['https://example.com/legacy'])
+  })
+
   it('skips the database lookup when the endpoints collection is disabled', async () => {
     const payload = stubPayload()
     await resolveEndpoints({

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import type { CollectionAfterChangeHook, CollectionAfterDeleteHook } from 'payload'
 
 import type { CollectionWebhookConfig, WebhookEvent } from '../types.js'
@@ -23,6 +24,10 @@ export function createAfterChangeHook(collectionSlug: string, watchConfig: Colle
     await req.payload.jobs.queue({
       task: DELIVER_WEBHOOK_TASK_SLUG,
       input: {
+        // Generated once per triggering event and reused across every retry of the
+        // resulting job, so receivers can dedupe on it and the job itself can skip
+        // endpoints it already resolved (see deliverWebhookTask.ts).
+        deliveryId: randomUUID(),
         collectionSlug,
         event,
         docId: doc.id,
@@ -51,6 +56,7 @@ export function createAfterDeleteHook(collectionSlug: string, watchConfig: Colle
     await req.payload.jobs.queue({
       task: DELIVER_WEBHOOK_TASK_SLUG,
       input: {
+        deliveryId: randomUUID(),
         collectionSlug,
         event: 'delete',
         docId: doc.id,

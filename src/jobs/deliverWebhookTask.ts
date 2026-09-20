@@ -1,18 +1,62 @@
-import type { TaskConfig } from 'payload'
+import type { Payload, TaskConfig } from 'payload'
 
-import type { OutboundWebhooksPluginConfig } from '../types.js'
+import type { OutboundWebhooksPluginConfig, WebhookEndpoint } from '../types.js'
 import { resolveEndpoints } from '../utilities/resolveEndpoints.js'
 import { signPayload } from '../utilities/signPayload.js'
+import { isRetryableStatus } from '../utilities/retryPolicy.js'
 
 export const DELIVER_WEBHOOK_TASK_SLUG = 'deliverWebhook' as const
 
 export interface DeliverWebhookInput {
+  /** Stable across every retry of this job — see createEventHooks.ts. */
+  deliveryId: string
   collectionSlug: string
   event: 'create' | 'update' | 'delete'
   docId: string | number
   doc: Record<string, unknown>
   previousDoc?: Record<string, unknown>
   occurredAt: string
+}
+
+/**
+ * Looks up which endpoints (by URL) this deliveryId has already been resolved for —
+ * either delivered successfully, or permanently failed (non-retryable) — so a job
+ * retry only re-attempts endpoints that are still pending. Returns an empty set (i.e.
+ * "attempt everything") when the log collection is disabled, since there's nowhere
+ * to read prior state from; in that setup receivers must rely on `deliveryId` alone
+ * to dedupe any redelivery.
+ */
+async function getResolvedEndpointUrls({
+  payload,
+  pluginConfig,
+  deliveryId,
+}: {
+  payload: Payload
+  pluginConfig: OutboundWebhooksPluginConfig
+  deliveryId: string
+}): Promise<Set<string>> {
+  if (pluginConfig.enableDeliveryLog === false) return new Set()
+
+  const slug = pluginConfig.logsCollectionSlug ?? 'webhookLogs'
+  try {
+    const result = await payload.find({
+      collection: slug as 'webhookLogs',
+      where: {
+        and: [
+          { deliveryId: { equals: deliveryId } },
+          { or: [{ status: { equals: 'delivered' } }, { retryable: { equals: false } }] },
+        ],
+      },
+      limit: 0,
+      depth: 0,
+      overrideAccess: true,
+    })
+    return new Set(result.docs.map((d) => (d as unknown as { endpointUrl: string }).endpointUrl))
+  } catch {
+    // If the lookup itself fails, fall back to attempting every endpoint again —
+    // safer to risk a duplicate delivery than to silently drop one.
+    return new Set()
+  }
 }
 
 /**
@@ -25,6 +69,7 @@ export function buildDeliverWebhookTask(pluginConfig: OutboundWebhooksPluginConf
     slug: DELIVER_WEBHOOK_TASK_SLUG,
     retries: pluginConfig.maxRetries ?? 5,
     inputSchema: [
+      { name: 'deliveryId', type: 'text', required: true },
       { name: 'collectionSlug', type: 'text', required: true },
       { name: 'event', type: 'text', required: true },
       { name: 'docId', type: 'text', required: true },
@@ -34,93 +79,123 @@ export function buildDeliverWebhookTask(pluginConfig: OutboundWebhooksPluginConf
     ],
     outputSchema: [
       { name: 'delivered', type: 'number', required: true },
-      { name: 'failed', type: 'number', required: true },
+      { name: 'permanentlyFailed', type: 'number', required: true },
+      { name: 'retryableFailed', type: 'number', required: true },
     ],
     handler: async ({ input, req }) => {
-      const { collectionSlug, event, docId, doc, previousDoc, occurredAt } = input as DeliverWebhookInput
+      const { deliveryId, collectionSlug, event, docId, doc, previousDoc, occurredAt } = input as DeliverWebhookInput
       const payload = req.payload
 
-      const endpoints = await resolveEndpoints({ payload, pluginConfig, collectionSlug, event })
+      const allEndpoints = await resolveEndpoints({ payload, pluginConfig, collectionSlug, event })
+
+      // On a fresh job this is empty. On a retry, it's every endpoint we've already
+      // delivered to or permanently failed against for this exact deliveryId — skip
+      // them so a retry only touches endpoints that are still pending.
+      const alreadyResolved = await getResolvedEndpointUrls({ payload, pluginConfig, deliveryId })
+      const endpoints = allEndpoints.filter((e) => !alreadyResolved.has(e.url))
 
       let delivered = 0
-      let failed = 0
+      let permanentlyFailed = 0
+      let retryableFailed = 0
 
       for (const endpoint of endpoints) {
-        const body = JSON.stringify({
-          event: `${collectionSlug}.${event}`,
-          collection: collectionSlug,
-          docId,
-          doc,
-          previousDoc,
-          occurredAt,
-        })
+        const outcome = await attemptDelivery({ endpoint, deliveryId, collectionSlug, event, docId, doc, previousDoc, occurredAt, pluginConfig })
 
-        const timestamp = Math.floor(Date.now() / 1000)
-        const headers: Record<string, string> = {
-          'Content-Type': 'application/json',
-          'X-Webhook-Event': `${collectionSlug}.${event}`,
-          ...endpoint.headers,
-        }
-        if (endpoint.secret) {
-          headers['X-Webhook-Signature'] = signPayload({ body, secret: endpoint.secret, timestamp })
-        }
+        await logDelivery({ payload, pluginConfig, endpoint, deliveryId, event: `${collectionSlug}.${event}`, docId, ...outcome })
 
-        const controller = new AbortController()
-        const timeout = setTimeout(() => controller.abort(), pluginConfig.timeoutMs ?? 10_000)
-
-        try {
-          const res = await fetch(endpoint.url, { method: 'POST', headers, body, signal: controller.signal })
-          clearTimeout(timeout)
-
-          if (!res.ok) {
-            failed += 1
-            await logDelivery({ payload, pluginConfig, endpoint, event: `${collectionSlug}.${event}`, docId, status: 'failed', responseStatus: res.status })
-            continue
-          }
-
-          delivered += 1
-          await logDelivery({ payload, pluginConfig, endpoint, event: `${collectionSlug}.${event}`, docId, status: 'delivered', responseStatus: res.status })
-        } catch (err) {
-          clearTimeout(timeout)
-          failed += 1
-          await logDelivery({
-            payload,
-            pluginConfig,
-            endpoint,
-            event: `${collectionSlug}.${event}`,
-            docId,
-            status: 'failed',
-            error: err instanceof Error ? err.message : String(err),
-          })
-        }
+        if (outcome.status === 'delivered') delivered += 1
+        else if (outcome.retryable) retryableFailed += 1
+        else permanentlyFailed += 1
       }
 
-      // At-least-once: every endpoint is attempted, then any failure surfaces as
-      // a job failure so Payload's retry policy (`retries`) kicks in uniformly
-      // for HTTP errors, network errors, and timeouts. Receivers must dedupe
-      // on (event, docId) since retries can redeliver to healthy endpoints.
-      if (failed > 0) {
+      // Only retryable failures (network errors, timeouts, 5xx, 408, 429) trigger
+      // a job retry. Permanent failures (most 4xx — bad URL, revoked auth, deleted
+      // endpoint) are logged and left alone; retrying them would just repeat the
+      // same result every time and burn through the retry budget for nothing.
+      // Receivers should still dedupe on `deliveryId`, since a retry can legitimately
+      // redeliver to an endpoint that failed with a transient error last time.
+      if (retryableFailed > 0) {
         throw new Error(
-          `Webhook delivery failed for ${failed} endpoint(s) on ${collectionSlug}.${event} doc ${String(docId)}`,
+          `Webhook delivery: ${retryableFailed} retryable failure(s) on ${collectionSlug}.${event} doc ${String(docId)} (deliveryId ${deliveryId})`,
         )
       }
 
-      return { output: { delivered, failed } }
+      return { output: { delivered, permanentlyFailed, retryableFailed } }
     },
   }
 }
 
+type DeliveryOutcome =
+  | { status: 'delivered'; responseStatus: number; retryable: false }
+  | { status: 'failed'; retryable: boolean; responseStatus?: number; error?: string }
+
+async function attemptDelivery(args: {
+  endpoint: WebhookEndpoint
+  deliveryId: string
+  collectionSlug: string
+  event: 'create' | 'update' | 'delete'
+  docId: string | number
+  doc: Record<string, unknown>
+  previousDoc?: Record<string, unknown>
+  occurredAt: string
+  pluginConfig: OutboundWebhooksPluginConfig
+}): Promise<DeliveryOutcome> {
+  const { endpoint, deliveryId, collectionSlug, event, docId, doc, previousDoc, occurredAt, pluginConfig } = args
+
+  const body = JSON.stringify({
+    deliveryId,
+    event: `${collectionSlug}.${event}`,
+    collection: collectionSlug,
+    docId,
+    doc,
+    previousDoc,
+    occurredAt,
+  })
+
+  const timestamp = Math.floor(Date.now() / 1000)
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Webhook-Event': `${collectionSlug}.${event}`,
+    // Lets receivers dedupe redeliveries without parsing the body first.
+    'X-Webhook-Id': deliveryId,
+    ...endpoint.headers,
+  }
+  if (endpoint.secret) {
+    headers['X-Webhook-Signature'] = signPayload({ body, secret: endpoint.secret, timestamp })
+  }
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), pluginConfig.timeoutMs ?? 10_000)
+
+  try {
+    const res = await fetch(endpoint.url, { method: 'POST', headers, body, signal: controller.signal })
+    clearTimeout(timeout)
+
+    if (!res.ok) {
+      return { status: 'failed', retryable: isRetryableStatus(res.status), responseStatus: res.status }
+    }
+    return { status: 'delivered', responseStatus: res.status, retryable: false }
+  } catch (err) {
+    clearTimeout(timeout)
+    // fetch throws for network errors, DNS failures, and our own abort-on-timeout —
+    // none of these carry an HTTP status, and all are transient conditions worth retrying.
+    return { status: 'failed', retryable: true, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
 async function logDelivery(args: {
-  payload: import('payload').Payload
+  payload: Payload
   pluginConfig: OutboundWebhooksPluginConfig
   endpoint: { id?: string; url: string; label?: string }
+  deliveryId: string
   event: string
   docId: string | number
   status: 'delivered' | 'failed'
   responseStatus?: number
   error?: string
+  retryable?: boolean
 }): Promise<void> {
-  const { payload, pluginConfig, endpoint, event, docId, status, responseStatus, error } = args
+  const { payload, pluginConfig, endpoint, deliveryId, event, docId, status, responseStatus, error, retryable } = args
   if (pluginConfig.enableDeliveryLog === false) return
 
   const slug = pluginConfig.logsCollectionSlug ?? 'webhookLogs'
@@ -128,11 +203,13 @@ async function logDelivery(args: {
     await payload.create({
       collection: slug as 'webhookLogs',
       data: {
+        deliveryId,
         endpointUrl: endpoint.url,
         endpointLabel: endpoint.label,
         event,
         docId: String(docId),
         status,
+        retryable: status === 'failed' ? Boolean(retryable) : undefined,
         responseStatus,
         error,
         deliveredAt: new Date().toISOString(),

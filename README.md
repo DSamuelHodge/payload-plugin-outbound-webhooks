@@ -1,5 +1,7 @@
 # payload-plugin-outbound-webhooks
 
+[![npm version](https://img.shields.io/npm/v/payload-plugin-outbound-webhooks.svg)](https://www.npmjs.com/package/payload-plugin-outbound-webhooks) [![test](https://github.com/DSamuelHodge/payload-plugin-outbound-webhooks/actions/workflows/test.yml/badge.svg)](https://github.com/DSamuelHodge/payload-plugin-outbound-webhooks/actions/workflows/test.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Generic outbound webhooks for [Payload CMS](https://payloadcms.com). Fire signed HTTP callbacks whenever documents in chosen collections are created, updated, or deleted — delivered through Payload's Jobs Queue so it's non-blocking and durably retried.
 
 ## Why

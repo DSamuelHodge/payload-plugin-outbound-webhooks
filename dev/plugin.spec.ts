@@ -1,0 +1,119 @@
+import type { Payload } from 'payload'
+import http from 'node:http'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { verifyPayloadSignature } from '../src/index.js'
+
+// The dev config reads these at import time, so they must be set before the
+// dynamic import in beforeAll (static imports would hoist above this).
+process.env.WEBHOOK_SECRET ??= 'test-secret'
+process.env.PAYLOAD_SECRET ??= 'dev-secret'
+
+const DATABASE_URI = process.env.DATABASE_URI ?? process.env.DATABASE_URL
+if (!DATABASE_URI) {
+  throw new Error(
+    'Set DATABASE_URI (or DATABASE_URL) to a Postgres database before running integration tests.',
+  )
+}
+process.env.DATABASE_URI = DATABASE_URI
+
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET as string
+
+let payload: Payload
+let receivedRequests: Array<{ body: string; headers: http.IncomingHttpHeaders }> = []
+let receiver: http.Server
+
+/** Binds an ephemeral port then releases it, yielding a (virtually) guaranteed-closed port. */
+async function getClosedPort(): Promise<number> {
+  const server = http.createServer()
+  await new Promise<void>((resolve) => server.listen(0, resolve))
+  const { port } = server.address() as { port: number }
+  await new Promise<void>((resolve, reject) =>
+    server.close((err) => (err ? reject(err) : resolve())),
+  )
+  return port
+}
+
+beforeAll(async () => {
+  const [{ default: config }, { getPayload }] = await Promise.all([
+    import('./payload.config.js'),
+    import('payload'),
+  ])
+  payload = await getPayload({ config })
+
+  // Minimal local HTTP receiver standing in for the real destination.
+  receiver = http.createServer((req, res) => {
+    let body = ''
+    req.on('data', (chunk) => (body += chunk))
+    req.on('end', () => {
+      receivedRequests.push({ body, headers: req.headers })
+      res.writeHead(200)
+      res.end('ok')
+    })
+  })
+  await new Promise<void>((resolve) => receiver.listen(4000, resolve))
+}, 120_000)
+
+afterAll(async () => {
+  await new Promise((resolve) => receiver.close(resolve))
+  await payload.db.destroy()
+})
+
+beforeEach(() => {
+  receivedRequests = []
+})
+
+describe('outboundWebhooksPlugin', () => {
+  it('queues and delivers a signed webhook when a watched collection changes', async () => {
+    const order = await payload.create({ collection: 'orders', data: { total: 42 } })
+
+    // Run due jobs synchronously instead of waiting on the cron schedule.
+    await payload.jobs.run()
+
+    expect(receivedRequests).toHaveLength(1)
+    const [request] = receivedRequests
+    const parsed = JSON.parse(request.body)
+    expect(parsed.event).toBe('orders.create')
+    expect(parsed.docId).toBe(order.id)
+
+    const signature = request.headers['x-webhook-signature'] as string
+    expect(
+      verifyPayloadSignature({ body: request.body, header: signature, secret: WEBHOOK_SECRET }),
+    ).toBe(true)
+  })
+
+  it('respects a collection filter and does not fire when the condition is not met', async () => {
+    await payload.create({ collection: 'posts', data: { title: 'Draft post', status: 'draft' } })
+    await payload.jobs.run()
+    expect(receivedRequests).toHaveLength(0)
+  })
+
+  it('logs a failed delivery when the endpoint is unreachable', async () => {
+    const deadUrl = `http://localhost:${await getClosedPort()}/hook`
+    await payload.create({
+      collection: 'webhookEndpoints',
+      data: {
+        label: 'Dead endpoint',
+        url: deadUrl,
+        subscriptions: ['orders.*'],
+      },
+      overrideAccess: true,
+    })
+
+    const order = await payload.create({ collection: 'orders', data: { total: 7 } })
+    await payload.jobs.run()
+
+    // The static receiver still gets its copy; only the dead endpoint fails.
+    expect(receivedRequests).toHaveLength(1)
+
+    const { docs } = await payload.find({
+      collection: 'webhookLogs',
+      where: {
+        and: [{ endpointUrl: { equals: deadUrl } }, { docId: { equals: String(order.id) } }],
+      },
+      overrideAccess: true,
+    })
+    expect(docs).toHaveLength(1)
+    expect(docs[0].status).toBe('failed')
+    expect(docs[0].error).toBeTruthy()
+  })
+})

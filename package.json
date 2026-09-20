@@ -1,0 +1,44 @@
+{
+  "name": "payload-plugin-outbound-webhooks",
+  "version": "0.1.0",
+  "description": "Generic outbound webhooks for Payload CMS: fire signed HTTP callbacks on collection create/update/delete, delivered durably via the Jobs Queue.",
+  "keywords": [
+    "payload",
+    "payloadcms",
+    "payload-plugin",
+    "webhooks",
+    "cms"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run --config vitest.config.ts",
+    "test:int": "vitest run --config vitest.int.config.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "pnpm run build"
+  },
+  "peerDependencies": {
+    "payload": "^3.0.0"
+  },
+  "devDependencies": {
+    "@payloadcms/db-postgres": "^3.90.1",
+    "@payloadcms/richtext-lexical": "^3.90.1",
+    "@types/node": "^20.0.0",
+    "payload": "^3.90.1",
+    "typescript": "^5.4.0",
+    "vitest": "^5.0.1"
+  }
+}

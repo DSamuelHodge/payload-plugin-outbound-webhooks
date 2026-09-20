@@ -180,4 +180,62 @@ describe('outboundWebhooksPlugin', () => {
       overrideAccess: true,
     })
   })
+
+  it('gives a manually re-enabled endpoint a fresh run at the threshold', async () => {
+    const deadUrl = `http://localhost:${await getClosedPort()}/hook`
+    const deadEndpoint = await payload.create({
+      collection: 'webhookEndpoints',
+      data: {
+        label: 'Re-enable test endpoint',
+        url: deadUrl,
+        subscriptions: ['orders.*'],
+      },
+      overrideAccess: true,
+    })
+
+    const readEndpoint = () =>
+      payload.findByID({ collection: 'webhookEndpoints', id: deadEndpoint.id, overrideAccess: true })
+    const countDeadLogs = async () => {
+      const { totalDocs } = await payload.count({
+        collection: 'webhookLogs',
+        where: { endpointUrl: { equals: deadUrl } },
+        overrideAccess: true,
+      })
+      return totalDocs
+    }
+
+    // Trip the breaker (dev failureThreshold: 2).
+    await payload.create({ collection: 'orders', data: { total: 1 } })
+    await payload.jobs.run()
+    await payload.create({ collection: 'orders', data: { total: 2 } })
+    await payload.jobs.run()
+    expect((await readEndpoint()).autoDisabled).toBe(true)
+    expect(await countDeadLogs()).toBe(2)
+
+    // Unchecking autoDisabled resets the counter via the beforeChange hook.
+    await payload.update({
+      collection: 'webhookEndpoints',
+      id: deadEndpoint.id,
+      data: { autoDisabled: false },
+      overrideAccess: true,
+    })
+    const reenabled = await readEndpoint()
+    expect(reenabled.autoDisabled).toBe(false)
+    expect(reenabled.consecutiveFailures).toBe(0)
+
+    // Next delivery attempts the endpoint again instead of skipping it…
+    await payload.create({ collection: 'orders', data: { total: 3 } })
+    await payload.jobs.run()
+    expect(await countDeadLogs()).toBe(3)
+    // …and one failure against a zeroed counter does NOT re-trip (1 < 2).
+    const afterProbe = await readEndpoint()
+    expect(afterProbe.consecutiveFailures).toBe(1)
+    expect(afterProbe.autoDisabled).not.toBe(true)
+
+    await payload.delete({
+      collection: 'webhookEndpoints',
+      id: deadEndpoint.id,
+      overrideAccess: true,
+    })
+  })
 })

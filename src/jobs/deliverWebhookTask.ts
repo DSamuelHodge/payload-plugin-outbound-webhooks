@@ -2,10 +2,10 @@ import type { Payload, TaskConfig } from 'payload'
 
 import type { OutboundWebhooksPluginConfig, WebhookEndpoint } from '../types.js'
 import {
-  countConsecutiveFailures,
   isBreakerEnabled,
   nextConsecutiveFailures,
   resolveFailureThreshold,
+  shouldSkipStaticEndpoint,
 } from '../utilities/circuitBreaker.js'
 import { resolveEndpoints } from '../utilities/resolveEndpoints.js'
 import { signPayload } from '../utilities/signPayload.js'
@@ -112,9 +112,11 @@ export function buildDeliverWebhookTask(pluginConfig: OutboundWebhooksPluginConf
         // Circuit-breaker, history path: endpoints without a managed
         // `webhookEndpoints` doc (static endpoints, or the endpoints collection
         // is disabled) keep no persistent counter, so a streak of recent
-        // failures in the delivery log is the trip signal. Doc-backed endpoints
-        // carry their own counter (see recordBreakerOutcome) and were already
-        // filtered by resolveEndpoints once tripped.
+        // failures in the delivery log is the trip signal — with a half-open
+        // probe once breakerProbeIntervalMs has elapsed, so tripped endpoints
+        // can self-heal. Doc-backed endpoints carry their own counter (see
+        // recordBreakerOutcome) and were already filtered by resolveEndpoints
+        // once tripped.
         if (
           breakerOn &&
           !isDocManagedEndpoint(pluginConfig, endpoint) &&
@@ -172,9 +174,12 @@ function isDocManagedEndpoint(
 
 /**
  * Log-derived trip check for endpoints without a managed doc. Reads at most
- * `threshold` recent attempts for the URL (newest first) and trips when every
- * one of them failed. Fail-open: a broken lookup attempts delivery rather
- * than silently dropping it.
+ * `threshold` recent attempts for the URL (newest first) and delegates the
+ * skip decision to shouldSkipStaticEndpoint — tripped endpoints are skipped
+ * until the probe interval elapses, at which point one half-open probe goes
+ * through so a recovered destination can self-heal (a success breaks the
+ * streak; a failure restarts the cooldown). Fail-open: a broken lookup
+ * attempts delivery rather than silently dropping it.
  */
 async function isTrippedByHistory({
   payload,
@@ -199,11 +204,12 @@ async function isTrippedByHistory({
       depth: 0,
       overrideAccess: true,
     })
-    return (
-      countConsecutiveFailures(
-        result.docs as unknown as Array<{ status: 'delivered' | 'failed' }>,
-      ) >= threshold
-    )
+    return shouldSkipStaticEndpoint({
+      attemptsNewestFirst:
+        result.docs as unknown as Array<{ status: 'delivered' | 'failed'; deliveredAt?: string }>,
+      failureThreshold: threshold,
+      probeIntervalMs: pluginConfig.breakerProbeIntervalMs,
+    })
   } catch {
     return false
   }

@@ -30,8 +30,22 @@ describe('createAfterChangeHook', () => {
         event: 'create',
         docId: 'abc123',
         doc: DOC,
+        deliveryId: expect.any(String),
       }),
     })
+  })
+
+  it('generates a fresh deliveryId per triggering event', async () => {
+    const { queue, req } = stubReq()
+    const hook = createAfterChangeHook('orders', {})
+    await hook({ doc: DOC, operation: 'create', req } as never)
+    await hook({ doc: DOC, operation: 'update', req } as never)
+
+    const firstId = queue.mock.calls[0][0].input.deliveryId
+    const secondId = queue.mock.calls[1][0].input.deliveryId
+    expect(firstId).toBeTruthy()
+    expect(secondId).toBeTruthy()
+    expect(firstId).not.toEqual(secondId)
   })
 
   it('maps the update operation to the update event', async () => {
@@ -79,7 +93,7 @@ describe('createAfterDeleteHook', () => {
 
     expect(queue).toHaveBeenCalledWith({
       task: DELIVER_WEBHOOK_TASK_SLUG,
-      input: expect.objectContaining({ collectionSlug: 'orders', event: 'delete' }),
+      input: expect.objectContaining({ collectionSlug: 'orders', event: 'delete', deliveryId: expect.any(String) }),
     })
   })
 

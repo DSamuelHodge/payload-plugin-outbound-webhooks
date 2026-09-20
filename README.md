@@ -65,6 +65,7 @@ posts: {
 
 ```json
 {
+  "deliveryId": "b6b6e1c2-...",
   "event": "orders.create",
   "collection": "orders",
   "docId": "64f...",
@@ -74,11 +75,16 @@ posts: {
 }
 ```
 
-`docId` mirrors your collection's id type (string or number). Every request carries `Content-Type: application/json` and an `X-Webhook-Event` header (e.g. `orders.create`), plus `X-Webhook-Signature` when the endpoint has a `secret` set.
+`docId` mirrors your collection's id type (string or number). `deliveryId` is generated once per triggering event (create/update/delete) and stays the same across every retry of that delivery — use it as your idempotency/dedupe key. Every request carries `Content-Type: application/json`, an `X-Webhook-Event` header (e.g. `orders.create`), and an `X-Webhook-Id` header mirroring `deliveryId` (so you can dedupe without parsing the body), plus `X-Webhook-Signature` when the endpoint has a `secret` set.
 
 ## Delivery guarantees
 
-Delivery is **at-least-once**: every subscribed endpoint is attempted, and any failure (HTTP error, network error, timeout) fails the job so Payload's Jobs Queue retries it up to `maxRetries` times (default `5`). Because retries can redeliver to endpoints that already succeeded, receivers should dedupe on `(event, docId)`.
+Delivery is **at-least-once**, with retries classified by failure type:
+
+- **Retryable** failures — network errors, timeouts, and HTTP `5xx`/`408`/`429` responses — fail the job so Payload's Jobs Queue retries it, up to `maxRetries` times (default `5`).
+- **Permanent** failures — any other `4xx` response (bad URL, revoked auth, endpoint deleted, etc.) — are logged but *not* retried, since resending the identical request would fail the same way every time.
+
+On a retry, only endpoints still pending are re-attempted: endpoints that already succeeded or permanently failed for that `deliveryId` are skipped (tracked via the `webhookLogs` collection, so this requires `enableDeliveryLog` to stay on). Because a retry can still redeliver to an endpoint that failed with a transient error, receivers should dedupe on `deliveryId` (or the `X-Webhook-Id` header) rather than `(event, docId)`.
 
 ## Verifying the signature
 

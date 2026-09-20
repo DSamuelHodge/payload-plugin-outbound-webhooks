@@ -1,6 +1,6 @@
 {
   "name": "payload-plugin-outbound-webhooks",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Generic outbound webhooks for Payload CMS: fire signed HTTP callbacks on collection create/update/delete, delivered durably via the Jobs Queue.",
   "keywords": [
     "payload",

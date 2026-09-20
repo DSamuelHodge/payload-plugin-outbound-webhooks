@@ -92,8 +92,8 @@ On a retry, only endpoints still pending are re-attempted: endpoints that alread
 
 Retries are per-delivery; the circuit-breaker protects you *across* deliveries. After `failureThreshold` consecutive failures (default `5`, set to `0` to disable), an endpoint is automatically disabled so a dead destination stops burning job retries:
 
-- **Admin-managed endpoints** (`webhookEndpoints` collection) keep a persistent `consecutiveFailures` counter on their doc. Any success resets it; reaching the threshold sets `autoDisabled`, and delivery skips the endpoint from then on. This works even with `enableDeliveryLog: false`. To re-enable, fix the destination and uncheck `autoDisabled` in the admin UI (the counter resets on the next success).
-- **Static endpoints** (the `endpoints` array) have no doc to store a counter on, so the breaker reads their recent delivery history instead: if the last `failureThreshold` attempts for that URL all failed, the endpoint is skipped for this delivery (reported as `skipped` in the job output). This requires `enableDeliveryLog` to stay on — with the log disabled there is no history to read, so static endpoints are attempted every time (same caveat as retry-skip above).
+- **Admin-managed endpoints** (`webhookEndpoints` collection) keep a persistent `consecutiveFailures` counter on their doc. Any success resets it; reaching the threshold sets `autoDisabled`, and delivery skips the endpoint from then on. This works even with `enableDeliveryLog: false`. To re-enable, fix the destination and uncheck `autoDisabled` in the admin UI — a `beforeChange` hook zeroes `consecutiveFailures` at the same time, so the endpoint gets a fresh run at the threshold instead of re-tripping on the next single failure.
+- **Static endpoints** (the `endpoints` array) have no doc to store a counter on, so the breaker reads their recent delivery history instead: if the last `failureThreshold` attempts for that URL all failed, the endpoint is skipped for this delivery (reported as `skipped` in the job output). This requires `enableDeliveryLog` to stay on — with the log disabled there is no history to read, so static endpoints are attempted every time (same caveat as retry-skip above). Tripped static endpoints self-heal via a half-open probe: once `breakerProbeIntervalMs` (default 5 minutes) has passed since the last attempt, one delivery is let through. If it succeeds, the streak is broken and normal delivery resumes; if it fails, the endpoint stays tripped and the cooldown restarts. To force an immediate retry instead of waiting out the cooldown, delete that URL's recent `webhookLogs` rows.
 
 Both retryable (5xx, timeouts) and permanent (4xx) failures count toward the streak — a `404` from a deleted destination trips the breaker just like a `500` storm does.
 
@@ -124,6 +124,7 @@ The helper also rejects signatures older than 5 minutes by default (`toleranceSe
 | `enableDeliveryLog`          | `boolean`                            | `true`                | Adds the `webhookLogs` admin collection.                    |
 | `maxRetries`                 | `number`                             | `5`                   | Job retry attempts per delivery.                            |
 | `failureThreshold`           | `number`                             | `5`                   | Consecutive failures before an endpoint is auto-disabled (`0` disables). |
+| `breakerProbeIntervalMs`     | `number`                             | `300000`              | Cooldown before a tripped static endpoint gets a half-open probe (`0` probes every delivery). |
 | `timeoutMs`                  | `number`                             | `10000`               | Per-attempt request timeout.                                |
 
 ## Development

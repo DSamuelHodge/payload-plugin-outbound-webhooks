@@ -1,8 +1,34 @@
-import type { CollectionConfig } from 'payload'
+import type { CollectionBeforeChangeHook, CollectionConfig } from 'payload'
+
+/**
+ * Gives a manually re-enabled endpoint a fresh run at the threshold. Without
+ * this, unchecking `autoDisabled` leaves the old `consecutiveFailures` value
+ * in place (e.g. 5 against a threshold of 5), so a single failure on the very
+ * next attempt re-trips the breaker and the editor gets zero grace period.
+ * Only fires on the true → false transition; every other update passes through
+ * untouched.
+ */
+export const resetBreakerCounterOnReenable: CollectionBeforeChangeHook = ({
+  data,
+  originalDoc,
+  operation,
+}) => {
+  if (
+    operation === 'update' &&
+    (originalDoc as { autoDisabled?: boolean } | undefined)?.autoDisabled === true &&
+    (data as { autoDisabled?: boolean } | undefined)?.autoDisabled === false
+  ) {
+    ;(data as { consecutiveFailures?: number }).consecutiveFailures = 0
+  }
+  return data
+}
 
 export function buildWebhookEndpointsCollection(slug: string): CollectionConfig {
   return {
     slug,
+    hooks: {
+      beforeChange: [resetBreakerCounterOnReenable],
+    },
     admin: {
       useAsTitle: 'label',
       defaultColumns: ['label', 'url', 'subscriptions', 'active', 'autoDisabled'],
@@ -57,7 +83,7 @@ export function buildWebhookEndpointsCollection(slug: string): CollectionConfig 
         defaultValue: false,
         admin: {
           description:
-            'Set automatically by the circuit-breaker once consecutive failures reach failureThreshold. Uncheck to re-enable the endpoint after fixing the destination.',
+            'Set automatically by the circuit-breaker once consecutive failures reach failureThreshold. Uncheck to re-enable the endpoint after fixing the destination (the failure counter resets to 0 automatically).',
         },
       },
       {

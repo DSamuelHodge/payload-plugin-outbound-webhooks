@@ -34,7 +34,8 @@ export interface WebhookEndpoint {
   consecutiveFailures?: number
   /**
    * Set automatically once `consecutiveFailures` reaches `failureThreshold`.
-   * Skipped by delivery until an editor unchecks it (manual half-open reset).
+   * Skipped by delivery until an editor unchecks it, which also resets
+   * `consecutiveFailures` to 0 for a fresh run at the threshold.
    */
   autoDisabled?: boolean
   /** ISO timestamp of the most recent failed attempt. Set by the delivery job. */
@@ -84,6 +85,13 @@ export type OutboundWebhooksPluginConfig = {
    * (which requires `enableDeliveryLog`). Set to 0 to disable. @default 5
    */
   failureThreshold?: number
+  /**
+   * How long a tripped static endpoint stays skipped before one probe attempt
+   * is let through (half-open). A successful probe self-heals the endpoint; a
+   * failed one restarts the cooldown. Set to 0 to probe on every delivery.
+   * @default 300000 (5 minutes)
+   */
+  breakerProbeIntervalMs?: number
   /** Request timeout in milliseconds per delivery attempt. @default 10000 */
   timeoutMs?: number
   /** Override the slug used for the endpoints collection. @default 'webhookEndpoints' */

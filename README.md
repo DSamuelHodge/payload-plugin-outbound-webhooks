@@ -74,6 +74,12 @@ posts: {
 }
 ```
 
+`docId` mirrors your collection's id type (string or number). Every request carries `Content-Type: application/json` and an `X-Webhook-Event` header (e.g. `orders.create`), plus `X-Webhook-Signature` when the endpoint has a `secret` set.
+
+## Delivery guarantees
+
+Delivery is **at-least-once**: every subscribed endpoint is attempted, and any failure (HTTP error, network error, timeout) fails the job so Payload's Jobs Queue retries it up to `maxRetries` times (default `5`). Because retries can redeliver to endpoints that already succeeded, receivers should dedupe on `(event, docId)`.
+
 ## Verifying the signature
 
 If an endpoint has a `secret` set, requests include an `X-Webhook-Signature` header formatted as `t=<unix timestamp>,v1=<hmac-sha256 hex digest>`, signed over `${timestamp}.${rawBody}`. Verify it on the receiving end:

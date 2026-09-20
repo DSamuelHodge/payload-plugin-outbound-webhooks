@@ -27,7 +27,16 @@ export function verifyPayloadSignature({
   secret: string
   toleranceSeconds?: number
 }): boolean {
-  const parts = Object.fromEntries(header.split(',').map((p) => p.split('=') as [string, string]))
+  // Never throw on untrusted input — receivers see all kinds of garbage headers.
+  if (typeof body !== 'string' || typeof header !== 'string' || typeof secret !== 'string' || !secret) {
+    return false
+  }
+  const parts: Record<string, string> = {}
+  for (const pair of header.split(',')) {
+    const idx = pair.indexOf('=')
+    if (idx === -1) return false
+    parts[pair.slice(0, idx)] = pair.slice(idx + 1)
+  }
   const timestamp = Number(parts.t)
   const signature = parts.v1
   if (!timestamp || !signature) return false

@@ -53,6 +53,9 @@ export default buildConfig({
       // Editors can add more endpoints at /admin/collections/webhookEndpoints without a deploy.
       enableEndpointsCollection: true,
       enableDeliveryLog: true,
+      // No retries here so tests observe exactly one delivery attempt per job run.
+      // Production configs should leave the default (5) for at-least-once delivery.
+      maxRetries: 0,
     }),
   ],
 })

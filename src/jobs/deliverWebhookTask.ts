@@ -75,8 +75,7 @@ export function buildDeliverWebhookTask(pluginConfig: OutboundWebhooksPluginConf
           if (!res.ok) {
             failed += 1
             await logDelivery({ payload, pluginConfig, endpoint, event: `${collectionSlug}.${event}`, docId, status: 'failed', responseStatus: res.status })
-            // Throwing surfaces this attempt as a job failure so Payload's job retry policy kicks in.
-            throw new Error(`Webhook endpoint ${endpoint.url} responded with ${res.status}`)
+            continue
           }
 
           delivered += 1
@@ -94,6 +93,16 @@ export function buildDeliverWebhookTask(pluginConfig: OutboundWebhooksPluginConf
             error: err instanceof Error ? err.message : String(err),
           })
         }
+      }
+
+      // At-least-once: every endpoint is attempted, then any failure surfaces as
+      // a job failure so Payload's retry policy (`retries`) kicks in uniformly
+      // for HTTP errors, network errors, and timeouts. Receivers must dedupe
+      // on (event, docId) since retries can redeliver to healthy endpoints.
+      if (failed > 0) {
+        throw new Error(
+          `Webhook delivery failed for ${failed} endpoint(s) on ${collectionSlug}.${event} doc ${String(docId)}`,
+        )
       }
 
       return { output: { delivered, failed } }

@@ -45,4 +45,18 @@ describe('verifyPayloadSignature', () => {
       false,
     )
   })
+
+  it('rejects a header missing the v1 part', () => {
+    const timestamp = Math.floor(Date.now() / 1000)
+    expect(
+      verifyPayloadSignature({ body: BODY, header: `t=${timestamp}`, secret: SECRET }),
+    ).toBe(false)
+  })
+
+  it('returns false instead of throwing on missing inputs', () => {
+    expect(
+      verifyPayloadSignature({ body: BODY, header: undefined as unknown as string, secret: SECRET }),
+    ).toBe(false)
+    expect(verifyPayloadSignature({ body: BODY, header: freshHeader(), secret: '' })).toBe(false)
+  })
 })

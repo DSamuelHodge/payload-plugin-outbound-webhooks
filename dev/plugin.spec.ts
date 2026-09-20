@@ -89,7 +89,7 @@ describe('outboundWebhooksPlugin', () => {
 
   it('logs a failed delivery when the endpoint is unreachable', async () => {
     const deadUrl = `http://localhost:${await getClosedPort()}/hook`
-    await payload.create({
+    const deadEndpoint = await payload.create({
       collection: 'webhookEndpoints',
       data: {
         label: 'Dead endpoint',
@@ -100,7 +100,13 @@ describe('outboundWebhooksPlugin', () => {
     })
 
     const order = await payload.create({ collection: 'orders', data: { total: 7 } })
-    await payload.jobs.run()
+    // run() resolves even when jobs fail; the failure shows up in jobStatus.
+    // Dev sets maxRetries: 0, so this fails fast with no retry.
+    const { jobStatus } = await payload.jobs.run()
+    const statuses = Object.values(jobStatus ?? {}).map((job) =>
+      typeof job === 'object' && job !== null ? (job as { status?: unknown }).status : job,
+    )
+    expect(statuses).toContain('error-reached-max-retries')
 
     // The static receiver still gets its copy; only the dead endpoint fails.
     expect(receivedRequests).toHaveLength(1)
@@ -115,5 +121,12 @@ describe('outboundWebhooksPlugin', () => {
     expect(docs).toHaveLength(1)
     expect(docs[0].status).toBe('failed')
     expect(docs[0].error).toBeTruthy()
+
+    // Keep reruns isolated: remove the dead endpoint (log rows stay, filtered by docId).
+    await payload.delete({
+      collection: 'webhookEndpoints',
+      id: deadEndpoint.id,
+      overrideAccess: true,
+    })
   })
 })

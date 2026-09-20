@@ -30,11 +30,14 @@ export async function resolveEndpoints({
   let dbEndpoints: WebhookEndpoint[] = []
   if (pluginConfig.enableEndpointsCollection !== false) {
     const slug = pluginConfig.endpointsCollectionSlug ?? 'webhookEndpoints'
+    // System read: delivery must not depend on admin-UI access rules, which
+    // reasonably require a logged-in user the job context doesn't have.
     const result = await payload.find({
       collection: slug as 'webhookEndpoints',
       where: { active: { not_equals: false } },
       limit: 0,
       depth: 0,
+      overrideAccess: true,
     })
     dbEndpoints = result.docs as unknown as WebhookEndpoint[]
   }
